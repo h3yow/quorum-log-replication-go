@@ -5,6 +5,7 @@ package statemachine
 
 import (
 	"encoding/json"
+	"sync"
 )
 
 // clientRecord remembers the last applied seq and its result per client, so
@@ -22,8 +23,9 @@ type snapshotData struct {
 
 // KVStore is the application state machine driven by committed entries.
 type KVStore struct {
-	// fields are accessed under the raft event loop when applying; Snapshot
-	// and Restore may run concurrently with reads, hence the RWMutex.
+	// mu guards kv/clients. Mutations happen on the raft event loop while
+	// read-only evidence/snapshot reads run from other goroutines.
+	mu      sync.RWMutex
 	kv      map[string]string
 	clients map[string]clientRecord
 }
@@ -46,6 +48,8 @@ func (k *KVStore) Apply(cmd []byte) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
 	if c.ClientID != "" {
 		if rec, ok := k.clients[c.ClientID]; ok {
 			if c.Seq <= rec.Seq {
@@ -74,12 +78,30 @@ func (k *KVStore) Apply(cmd []byte) (Result, error) {
 // Get returns the current value. Read consistency is enforced by the raft
 // layer (read index); the store itself reflects the committed/applied state.
 func (k *KVStore) Get(key string) (string, bool) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
 	v, ok := k.kv[key]
 	return v, ok
 }
 
+// ClientSeq is a read-only evidence accessor: it reports the highest sequence
+// number applied for clientID and whether that client is known. Failure drills
+// use it to prove that a retried request never advanced a client's applied
+// frontier twice; it never mutates state and takes no raft path.
+func (k *KVStore) ClientSeq(clientID string) (seq uint64, known bool) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
+	rec, ok := k.clients[clientID]
+	if !ok {
+		return 0, false
+	}
+	return rec.Seq, true
+}
+
 // Snapshot serializes the whole store atomically with its dedup table.
 func (k *KVStore) Snapshot() ([]byte, error) {
+	k.mu.RLock()
+	defer k.mu.RUnlock()
 	sd := snapshotData{
 		KV:      make(map[string]string, len(k.kv)),
 		Clients: make(map[string]clientRecord, len(k.clients)),
@@ -99,6 +121,8 @@ func (k *KVStore) Restore(data []byte) error {
 	if err := json.Unmarshal(data, &sd); err != nil {
 		return err
 	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
 	k.kv = sd.KV
 	k.clients = sd.Clients
 	if k.kv == nil {

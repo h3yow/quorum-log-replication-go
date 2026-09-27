@@ -17,11 +17,18 @@ func (n *Node) applyTo(target uint64) {
 	if target > n.commit {
 		target = n.commit
 	}
-	for ; n.applied < target; n.applied++ {
+	for n.applied < target {
 		idx := n.applied + 1
 		ents, err := n.log.Entries(idx, idx+1)
 		if err != nil || len(ents) != 1 {
-			n.logger.warnf("applyTo: missing committed entry %d: %v", idx, err)
+			// The committed entry is not present locally yet (it can briefly
+			// land in the snapshot/WAL boundary window while a snapshot is
+			// being installed). STOP without advancing n.applied: the post
+			// increment belongs only to a successfully applied entry,
+			// otherwise the index would be skipped forever and the applied
+			// watermark would over-report the real state. A later
+			// AppendEntries/InstallSnapshot re-enters applyTo and resumes here.
+			n.logger.warnf("applyTo: committed entry %d not yet available: %v", idx, err)
 			return
 		}
 		e := ents[0]
@@ -37,6 +44,7 @@ func (n *Node) applyTo(target uint64) {
 			res, aerr := n.app.Apply(e.Data)
 			n.finishConfigWaiters(idx, applyResult{res: res, err: aerr})
 		}
+		n.applied++
 	}
 	if n.applied > 0 {
 		// Persist the applied watermark so a crash/restart cannot replay

@@ -1,0 +1,5 @@
+# Go build output
+/qlog
+/cmd/qlog/qlog
+*.test
+*.out

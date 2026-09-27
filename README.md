@@ -19,7 +19,8 @@
 | `pkg/statemachine` | 线性化 KV 应用 + 基于 `(clientID, seq)` 的幂等去重表 + 快照 |
 | `pkg/raft` | Raft 核心：选举、日志复制、提交、read-index、联合共识成员变更、快照追赶 |
 | `pkg/cluster` | 多节点编排、崩溃/重启/分区/加删节点、客户端、只读观测入口 |
-| `cmd/qlog` | 统一的本地启动与脚本化验证入口 |
+| `pkg/drill` | 可重复、基于证据的故障演练与机器可读审计报告 |
+| `cmd/qlog` | 统一的本地启动、脚本化验证与故障演练入口 |
 
 所有 Raft 状态只在**单事件循环 goroutine** 上修改；网络收发在独立 goroutine
 中进行并以事件形式回到循环，因此不存在对核心状态的数据竞争（`go test -race`
@@ -90,12 +91,20 @@ C_old  ──append+commit──▶  C_{old,new} (joint)  ──append+commit─
 
 ## 本地验证（离线、可重复）
 
-统一入口会启动 5 节点集群并执行：选举、初始写入、幂等重试、少数派分区、
+统一入口默认启动 5 节点集群并执行：选举、初始写入、幂等重试、少数派分区、
 崩溃重启、加节点、加入后继续写入、快照压缩与落后追赶、并发写入：
 
 ```
 go run ./cmd/qlog
 ```
+
+需要**可留存、可复核的故障演练与审计报告**时使用 `-drill`，详见下文
+「故障演练」一节：
+
+```
+go run ./cmd/qlog -drill all
+```
+
 
 运行测试（含分区、故障切换、崩溃重启、损坏拒绝、成员变更、快照追赶、
 并发读写/变更）：
@@ -123,3 +132,108 @@ go test -race ./...
 `cluster.Options.SyncWrites`（默认 `false`）控制本地存储是否真正 `fsync`。
 模拟器默认关闭 fsync 以避免宿主/沙箱文件系统卡顿阻塞事件循环；磁盘格式的
 崩溃安全性仍由损坏/截断/重启测试验证。需要演练真实 fsync 持久化时设为 `true`。
+
+## 故障演练（可留存、可复核、可重复）
+
+除了“跑一遍看结果”的脚本化验证，`cmd/qlog` 还内置了四套**故障演练**，全部离线
+运行（不依赖网络、外部服务或人工盯日志），每套结束产出一份**机器可读 JSON
+审计报告**，并且只有在“故障确实生效”且“安全性质成立”两条都有证据时才给 PASS。
+
+### 运行方式
+
+```
+go run ./cmd/qlog -list-drills                 # 列出全部演练名
+go run ./cmd/qlog -drill all                   # 顺序跑完四套，报告打到 stdout
+go run ./cmd/qlog -drill majority-unreachable  # 只跑某一套
+go run ./cmd/qlog -drill all -report-out out/  # 每套一个 JSON 文件
+go run ./cmd/qlog -drill leader-crash-retry -report-out r.json
+```
+
+退出码非 0 表示至少一套演练结论为 FAIL；人类可读的每条判定也会同时打印。
+
+| 演练名 | 覆盖的故障与安全性质 |
+| --- | --- |
+| `majority-unreachable` | 多数派整体崩溃不可达时，幸存者无法确认新写入、提交位置不前进；多数派以更高任期恢复后，被拒写入绝不被追认，全集群收敛为同一份历史 |
+| `leader-crash-retry` | 写入结果未知的瞬间领导者硬崩溃；用同一 `(client,seq)` 经新领导者重试，状态机去重表证明该请求只生效一次（首次已提交则重试命中去重，首次丢失则重试恰好生效） |
+| `offline-compaction-catchup` | 节点离线足够久、错过至少一次压缩（领导者快照点严格越过其最后提交位置）后返回，经 InstallSnapshot 装入快照再增量追赶，窗口前后数据无空洞、全集群收敛 |
+| `membership-leader-switch` | 加节点变更在途（观察到 learner 暂存或 joint 配置）时领导者硬崩溃；故障切换后变更收敛为唯一一致配置，绝不半更新，写入与收敛保持正确 |
+
+### 审计报告字段（固定顺序）
+
+- `schema`：报告格式版本（当前 `qlog-drill/v1`）。
+- `scenario` / `input`：演练名与**固定输入**（节点数、各阶段写入条数、键前缀、
+  崩溃/变更的固定延迟毫秒）。同一 `input` 复跑应得到等价结论。
+- `passed`：总判定。它**只**由下面 `checks` 是否全部通过派生，脚本跑完不等于通过。
+- `checks[]`：每条判定 `{id, passed, evidence}`。`id` 与 `passed` 是稳定事实；
+  `evidence` 是给人看的细节（含当轮具体节点/任期，允许跨轮不同）。
+- `leader_trace[]`：各阶段观察到的领导者与任期（谁在何时主导、是否发生切换）。
+- `faults[]`：实际注入的故障（类型、阶段、涉及节点数、`took_effect`、证据）。
+- `writes[]`：关键写入的命运——被接受还是被拒、去重命中次数、**生效次数**。
+- `compaction`：追赶演练专用——离线时提交位置、返回时领导者快照边界、是否真的
+  跨过压缩点、实际装入的快照位置。
+- `membership`：成员变更演练专用——是否观察到 joint、新旧领导者、是否切换、最终选民。
+- `convergence`：最终各节点 commit/applied/快照位置、选民、状态摘要，以及
+  `history_hash`（规范化的已提交 KV 内容摘要）与 `reached`。
+- `started_at_iso` / `duration_ms`：时间戳与耗时，**允许**每次不同。
+- `content_hash`：对除时间外所有“历史事实”做的 SHA-256，用于复跑比对。
+
+### 可重复性边界（重要）
+
+复跑同一固定输入时**必须一致**的是：总判定、每条 check 的 `id/passed`、故障是否
+生效、写入接受/拒绝与生效次数、是否跨过压缩点、是否发生领导权切换、最终 commit/
+applied 位置、最终已提交历史（`history_hash`/`content_hash`）。
+
+允许不同的是：时间戳与耗时；**具体哪台机器**被选为领导者或受害者（选举超时是
+随机的）；节点的具体 term 编号；追赶演练里离线节点停下时的**具体提交位置**
+（可能因首个领导者提交启动条目的心跳时序相差一）。这些身份/调度信息被刻意排除在
+`content_hash` 之外（领导权“是否切换”“是否真跨过压缩点”作为布尔事实保留），因此
+不同机器中选或离线位置差一都不会让历史结论漂移；该具体位置仍完整保留在 JSON 报告
+的 `compaction.offline_commit_at` 中供查看。
+
+用固定输入复跑并比对：
+
+```
+go run ./cmd/qlog -drill all -report-out run1/
+go run ./cmd/qlog -drill all -report-out run2/
+# 比较每个场景 JSON 的 content_hash 与每条 checks[].passed；
+# started_at_iso / duration_ms / evidence 文本 / 具体节点名与 term 可忽略
+```
+
+### 证据原则：故障没真正生效就必须失败
+
+演练判定**不看步骤有没有跑到**，只看证据。例如：
+
+- 声称“多数派不可达”，必须实测旧领导者当前可达选民数 < 多数派，且恢复时多数派侧
+  选出**更高任期**的新领导者（否则被隔离领导者的未提交尾巴可能被错误追认）；
+- 声称“节点离线”，必须实测其在传输层不可达；
+- 声称“跨过压缩点”，必须实测领导者快照索引严格大于该节点离线时的最后提交位置；
+- 声称“领导权切换”，必须实测出现不同节点且任期严格增大。
+
+测试用一个**空操作故障注入器**（Crash/Restart/分区全部 no-op）和一个“只让单台
+宕机”的不足范围注入器验证：这些情况下演练一律 FAIL，绝不会因为脚本走完而 PASS。
+
+### 自动化测试
+
+```
+go test ./pkg/drill/            # 四类演练成功判定、失败判定、可重复性
+go test ./...                   # 含既有正常写入/崩溃恢复/成员变更/压缩追赶不回归
+go test -race ./...             # 数据竞争
+```
+
+关键用例：
+
+- `TestAllDrillsPassWithFixedInput`：四套演练在固定输入下全部 PASS；
+- `TestRepeatableVerdict`：同一输入独立复跑两次，判定与 `content_hash` 一致；
+- `TestNoFault*DrillFails` / `TestInsufficientFaultScopeFails`：故障不生效或范围
+  不足时演练必须 FAIL（异常用例不能只检查流程走到）；
+- `TestReportIsMachineReadable`：报告可序列化、字段齐全、哈希可重算。
+
+### 当前**未**覆盖的故障类型
+
+演练聚焦四类最关键的协调故障，尚**未**模拟：真实网络磁盘 IO（走的是进程内传输与
+本地文件，`SyncWrites=false` 时不真正 fsync）；拜占庭/恶意节点；持续随机丢包/延迟
+叠加（传输层支持 `DropRate/SetLatency`，但演练用确定性故障）；时钟漂移；脑裂后双写
+的人为客户端；快照文件物理损坏下的追赶；以及删除领导者（remove-leader）与故障
+叠加。这些是后续可扩展的方向，新增演练只需实现 `drill.Faults` 与一个场景函数并
+登记到 `drill.Scenarios()`。
+

@@ -243,13 +243,20 @@ func (c *Cluster) Restart(ctx context.Context, id string) error {
 	return nil
 }
 
-// AddNode creates a new on-disk node and adds it through the leader.
+// AddNode creates a new on-disk node and adds it through the leader. It is
+// safe to retry after a leader switch mid-change: if the id already has an
+// on-disk handle and is already a committed voter, the call is an idempotent
+// success; if the handle exists but the change never committed, it re-drives
+// the membership proposal through the current leader.
 func (c *Cluster) AddNode(ctx context.Context, id string) error {
 	c.mu.RLock()
 	_, exists := c.nodes[id]
 	c.mu.RUnlock()
 	if exists {
-		return fmt.Errorf("cluster: node %s exists", id)
+		// Already have a handle: determine whether it is a voting member by
+		// asking the current leader to perform the (idempotent) proposal. The
+		// raft layer treats an already-present voter as a no-op success.
+		return c.proposeToLeader(ctx, func(n *raft.Node) error { return n.AddServer(ctx, id) })
 	}
 	if err := c.openNode(ctx, id, nil); err != nil {
 		return err
