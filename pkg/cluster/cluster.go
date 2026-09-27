@@ -28,12 +28,14 @@ type nodeHandle struct {
 // mu guards the nodes map across concurrent membership changes, crashes,
 // restarts and read-only observations.
 type Cluster struct {
-	rootDir    string
-	tr         *transport.Transport
-	mu         sync.RWMutex
-	nodes      map[string]*nodeHandle
-	tickMS     int
-	syncWrites bool
+	rootDir     string
+	tr          *transport.Transport
+	mu          sync.RWMutex
+	nodes       map[string]*nodeHandle
+	tickMS      int
+	electionMin int
+	electionMax int
+	syncWrites  bool
 }
 
 // Options configures a bootstrapped cluster.
@@ -41,6 +43,12 @@ type Options struct {
 	DataDir string
 	NodeIDs []string
 	TickMS  int
+	// ElectionTickMin/Max bound the randomized follower election timeout in
+	// ticks. Zero defaults to the raft package's jittered range; setting both
+	// to the same value gives deterministic elections (used by the failure
+	// drills so repeated fixed inputs yield identical term histories).
+	ElectionTickMin int
+	ElectionTickMax int
 	// SyncWrites controls fsync on the durable stores. It defaults to false
 	// for the in-process simulator (offline, deterministic, and the sandbox
 	// filesystem can stall fsync badly). Crash-safety of the on-disk format is
@@ -59,11 +67,13 @@ func New(ctx context.Context, opt Options) (*Cluster, error) {
 		opt.TickMS = 25
 	}
 	c := &Cluster{
-		rootDir:    opt.DataDir,
-		tr:         transport.New(),
-		nodes:      map[string]*nodeHandle{},
-		tickMS:     opt.TickMS,
-		syncWrites: opt.SyncWrites,
+		rootDir:     opt.DataDir,
+		tr:          transport.New(),
+		nodes:       map[string]*nodeHandle{},
+		tickMS:      opt.TickMS,
+		electionMin: opt.ElectionTickMin,
+		electionMax: opt.ElectionTickMax,
+		syncWrites:  opt.SyncWrites,
 	}
 	initCfg := &raftproto.Config{Voters: append([]string(nil), opt.NodeIDs...)}
 	for _, id := range opt.NodeIDs {
@@ -77,10 +87,17 @@ func New(ctx context.Context, opt Options) (*Cluster, error) {
 
 func (c *Cluster) nodeConfig(id string) raft.Config {
 	tick := time.Duration(c.tickMS) * time.Millisecond
+	minT, maxT := c.electionMin, c.electionMax
+	if minT <= 0 {
+		minT = 16
+	}
+	if maxT <= 0 {
+		maxT = 30
+	}
 	return raft.Config{
 		ID:                id,
-		ElectionTickMin:   16,
-		ElectionTickMax:   30,
+		ElectionTickMin:   minT,
+		ElectionTickMax:   maxT,
 		HeartbeatTick:     1,
 		TickInterval:      tick,
 		SnapshotThreshold: 32,
@@ -243,16 +260,29 @@ func (c *Cluster) Restart(ctx context.Context, id string) error {
 	return nil
 }
 
-// AddNode creates a new on-disk node and adds it through the leader.
+// AddNode creates a new on-disk node and adds it through the leader. It is
+// safe to call again after a leader switch mid-change (the old attempt may
+// have staged the node as a learner or voter before crashing): a node that is
+// already a committed voter is an immediate success, otherwise the current
+// leader resumes or completes the joint-consensus transition.
 func (c *Cluster) AddNode(ctx context.Context, id string) error {
 	c.mu.RLock()
 	_, exists := c.nodes[id]
 	c.mu.RUnlock()
-	if exists {
-		return fmt.Errorf("cluster: node %s exists", id)
+	if !exists {
+		if err := c.openNode(ctx, id, nil); err != nil {
+			return err
+		}
 	}
-	if err := c.openNode(ctx, id, nil); err != nil {
-		return err
+	// If a previous attempt already committed this voter, converge as success.
+	if lead := c.Leader(); lead != "" {
+		if n := c.Node(lead); n != nil {
+			for _, v := range n.Status().CommittedConfig.Voters {
+				if v == id {
+					return nil
+				}
+			}
+		}
 	}
 	return c.proposeToLeader(ctx, func(n *raft.Node) error { return n.AddServer(ctx, id) })
 }

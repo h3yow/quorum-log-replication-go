@@ -112,9 +112,18 @@ func (n *Node) handleInstallSnapshot(from string, req *raftproto.InstallSnapshot
 	n.electionElapsed = 0
 	n.resetElectionTimeout()
 
-	if req.LastIncludedIndex < n.snapMeta.Index {
-		n.logger.infof("reject stale snapshot %d (have %d)",
+	// An equal snapshot is idempotent: the node already holds that prefix. It
+	// must NOT reinstall (which would Restore-wipe and Compact away entries
+	// already applied after the boundary), and a delayed/reordered snapshot
+	// RPC carrying the same index must never roll applied state backwards.
+	// Reply success so the leader can resume streaming the incremental tail;
+	// a strictly older snapshot is simply ignored.
+	if req.LastIncludedIndex <= n.snapMeta.Index {
+		n.logger.infof("ignore snapshot %d (already have %d)",
 			req.LastIncludedIndex, n.snapMeta.Index)
+		if req.LastIncludedIndex == n.snapMeta.Index {
+			resp.Success = true
+		}
 		return resp
 	}
 	if err := n.installSnapshot(req.Data, req.LastIncludedIndex, req.LastIncludedTerm, req.Config); err != nil {
@@ -136,6 +145,15 @@ func (n *Node) handleInstallSnapshot(from string, req *raftproto.InstallSnapshot
 // durable operation is: save snapshot file, discard superseded WAL entries,
 // restore application. Any failure leaves a distinguishable store error.
 func (n *Node) installSnapshot(data []byte, index, term uint64, cfg raftproto.Config) error {
+	// Never restore a snapshot at or below the applied watermark: doing so
+	// would overwrite the application with an older image and Compact away
+	// already-applied entries, a silent rollback of confirmed history. The
+	// caller already filters equal/older boundaries; this is the last guard.
+	if index <= n.applied {
+		n.logger.infof("skip snapshot install at %d: applied already at %d",
+			index, n.applied)
+		return nil
+	}
 	meta := raftproto.SnapshotMeta{Index: index, Term: term, Config: cfg}
 	if err := n.snaps.Save(meta, data); err != nil && err != logstore.ErrSnapOutOfDate {
 		return err

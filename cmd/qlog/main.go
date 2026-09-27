@@ -33,7 +33,14 @@ type step struct {
 func main() {
 	keep := flag.Bool("keep", false, "keep the on-disk data directory after the run")
 	nodes := flag.Int("nodes", 5, "number of cluster nodes")
+	drillCfg := registerDrillFlags(flag.CommandLine)
 	flag.Parse()
+
+	// Failure-drill mode: repeatable, self-verifying scenarios with a
+	// machine-readable audit report.
+	if drillCfg.selected != "" {
+		os.Exit(runDrills(drillCfg))
+	}
 
 	dir, err := os.MkdirTemp("", "qlog-")
 	must("create temp dir", err)

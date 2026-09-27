@@ -65,6 +65,10 @@ type Status struct {
 	CommittedConfig raftproto.Config
 	ActiveConfig    raftproto.Config
 	Progress        map[string]PeerProgress
+	// StateDigest is the deterministic digest of the applied key/value
+	// contents, computed on the event loop and cached like the other fields.
+	// Equal digests on every node mean equal confirmed histories.
+	StateDigest string
 }
 
 // Node is one raft server. All state mutation happens on its single event
@@ -140,6 +144,7 @@ type Node struct {
 	obsComm     raftproto.Config
 	obsActive   raftproto.Config
 	obsProgress map[string]PeerProgress
+	obsDigest   string
 }
 
 type applyResult struct {
@@ -284,6 +289,7 @@ func (n *Node) Status() Status {
 		CommittedConfig: cloneCfg(n.obsComm),
 		ActiveConfig:    cloneCfg(n.obsActive),
 		Progress:        prog,
+		StateDigest:     n.obsDigest,
 	}
 }
 

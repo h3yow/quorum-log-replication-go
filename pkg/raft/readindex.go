@@ -128,6 +128,7 @@ func (n *Node) refreshObs() {
 	n.obsComm = committed
 	n.obsActive = active
 	n.obsProgress = prog
+	n.obsDigest = n.app.ContentDigest()
 	n.obsMu.Unlock()
 }
 
@@ -149,6 +150,7 @@ func (n *Node) getStatus() Status {
 		CommittedConfig: cloneCfg(n.commCfg),
 		ActiveConfig:    cloneCfg(n.config),
 		Progress:        prog,
+		StateDigest:     n.app.ContentDigest(),
 	}
 }
 

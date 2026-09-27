@@ -66,6 +66,17 @@ func (t *Transport) Unregister(id string) {
 	t.alive[id] = false
 }
 
+// Registered reports whether id is currently attached to the network. Unlike
+// IsReachable it distinguishes a truly crashed/unregistered node (false) from
+// a live-but-partitioned node (true), which failure drills need as evidence
+// that a crash really took the node offline.
+func (t *Transport) Registered(id string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	_, ok := t.handlers[id]
+	return ok
+}
+
 // SetAlive flips the reachability flag of a registered node without
 // deleting its handler (used by hard-crash simulation).
 func (t *Transport) SetAlive(id string, alive bool) {
