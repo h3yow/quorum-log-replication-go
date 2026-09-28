@@ -103,6 +103,8 @@ func (r *Runner) Run(ctx context.Context, opt Options) (*Report, error) {
 		rep = runLeaderCrashRetry(fr)
 	case ScenarioSnapshotCatchup:
 		rep = runSnapshotCatchup(fr)
+	case ScenarioCatchupDuplicateSnapshot:
+		rep = runCatchupDuplicateSnapshot(fr)
 	case ScenarioMembershipLeaderSwitch:
 		rep = runMembershipLeaderSwitch(fr)
 	default:
@@ -145,6 +147,11 @@ func DefaultInput(s Scenario) Input {
 		return Input{NodeCount: 5, WritesBefore: 5, WritesDuring: 1, WritesAfter: 5, KeyPrefix: "lc", CrashDelayMS: 20, Seed: 0}
 	case ScenarioSnapshotCatchup:
 		return Input{NodeCount: 5, WritesBefore: 3, WritesDuring: 70, WritesAfter: 20, KeyPrefix: "sc", Seed: 0}
+	case ScenarioCatchupDuplicateSnapshot:
+		// 60 offline-window writes clear the 32-entry snapshot threshold by a
+		// wide margin; 40 post-catch-up writes push the victim well past the
+		// installed snapshot before the deterministic duplicate is replayed.
+		return Input{NodeCount: 5, WritesBefore: 60, WritesDuring: 0, WritesAfter: 40, KeyPrefix: "dc", Seed: 0}
 	case ScenarioMembershipLeaderSwitch:
 		return Input{NodeCount: 5, WritesBefore: 5, WritesDuring: 1, WritesAfter: 5, KeyPrefix: "ms", ChangeDelayMS: 200, Seed: 0}
 	default:

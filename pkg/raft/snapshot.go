@@ -112,9 +112,30 @@ func (n *Node) handleInstallSnapshot(from string, req *raftproto.InstallSnapshot
 	n.electionElapsed = 0
 	n.resetElectionTimeout()
 
-	if req.LastIncludedIndex < n.snapMeta.Index {
-		n.logger.infof("reject stale snapshot %d (have %d)",
-			req.LastIncludedIndex, n.snapMeta.Index)
+	// A snapshot must never move this node backwards.
+	//
+	// Once this node has installed a snapshot at index S (n.snapMeta.Index) it
+	// durably owns the whole prefix through S. Any leader snapshot whose
+	// LastIncludedIndex is <= S is therefore a stale or duplicated catch-up
+	// message (a network retransmission, an old leader's retry, or a snapshot
+	// the node already installed) and must be acknowledged but NOT reinstalled:
+	// reinstalling would Restore the state machine to the snapshot contents and
+	// Compact away the post-snapshot WAL while the node had already applied
+	// beyond them, silently dropping acknowledged writes while still reporting
+	// the newer applied index.
+	//
+	// The stricter comparison against n.commit additionally covers the window
+	// in which the node already applied entries past its latest snapshot
+	// (snapMeta.Index < commit): committed entries are final in Raft and can
+	// never be replaced by a snapshot that ends at or before them.
+	watermark := n.commit
+	if n.snapMeta.Index > watermark {
+		watermark = n.snapMeta.Index
+	}
+	if req.LastIncludedIndex <= watermark {
+		n.logger.infof("ignore stale/duplicate snapshot %d (snap=%d commit=%d applied=%d)",
+			req.LastIncludedIndex, n.snapMeta.Index, n.commit, n.applied)
+		resp.Success = true
 		return resp
 	}
 	if err := n.installSnapshot(req.Data, req.LastIncludedIndex, req.LastIncludedTerm, req.Config); err != nil {
@@ -136,6 +157,21 @@ func (n *Node) handleInstallSnapshot(from string, req *raftproto.InstallSnapshot
 // durable operation is: save snapshot file, discard superseded WAL entries,
 // restore application. Any failure leaves a distinguishable store error.
 func (n *Node) installSnapshot(data []byte, index, term uint64, cfg raftproto.Config) error {
+	// Defense in depth: installing a snapshot at an index this node already
+	// owns (installed snapshot or committed prefix) would Restore the state
+	// machine to older contents and Compact away newer WAL entries, producing a
+	// node whose applied frontier over-reports its real contents. The
+	// AppendEntries/InstallSnapshot handlers already gate this; refuse here too
+	// so the durable primitive can never move state backwards on its own.
+	watermark := n.commit
+	if n.snapMeta.Index > watermark {
+		watermark = n.snapMeta.Index
+	}
+	if index <= watermark {
+		n.logger.infof("installSnapshot refuses non-forward index %d (snap=%d commit=%d)",
+			index, n.snapMeta.Index, n.commit)
+		return nil
+	}
 	meta := raftproto.SnapshotMeta{Index: index, Term: term, Config: cfg}
 	if err := n.snaps.Save(meta, data); err != nil && err != logstore.ErrSnapOutOfDate {
 		return err

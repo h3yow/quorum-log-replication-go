@@ -82,23 +82,37 @@ func (r *Report) computeContentHash() string {
 		CrossedCompaction bool   `json:"crossed_compaction"`
 		InstalledSnapshot uint64 `json:"installed_snapshot_index"`
 	}
+	type duplicateCatchupNorm struct {
+		// Stable, run-independent facts about the deterministic duplicate
+		// retransmission and the node's monotonic frontier. The concrete node
+		// id and the offline index (may differ by one) are excluded.
+		InstalledSnapshot       uint64 `json:"installed_snapshot_index"`
+		AdvancedTo              uint64 `json:"advanced_to_before_replay"`
+		ReplayedOldest          uint64 `json:"replayed_oldest_snapshot"`
+		ReplayedNewest          uint64 `json:"replayed_newest_snapshot"`
+		AppliedAfterReplay      uint64 `json:"applied_after_replay"`
+		ContentsChangedAfter    bool   `json:"contents_changed_after_replay"`
+		FrontierRolledBackAfter bool   `json:"frontier_rolled_back_after_replay"`
+		ReplayTookEffect        bool   `json:"replay_took_effect"`
+	}
 	type writeNorm struct {
 		Label       string `json:"label"`
 		Applied     bool   `json:"applied"`
 		EffectCount int    `json:"effect_count"`
 	}
 	type digest struct {
-		Schema      string            `json:"schema"`
-		Scenario    Scenario          `json:"scenario"`
-		Input       Input             `json:"input"`
-		Passed      bool              `json:"passed"`
-		Checks      []checkNorm       `json:"checks"`
-		LeaderTrace []leaderEventNorm `json:"leader_trace"`
-		Faults      []faultNorm       `json:"faults"`
-		Writes      []writeNorm       `json:"writes"`
-		Compaction  *compactionNorm   `json:"compaction,omitempty"`
-		Membership  *membershipNorm   `json:"membership,omitempty"`
-		Convergence convergenceNorm   `json:"convergence"`
+		Schema      string                `json:"schema"`
+		Scenario    Scenario              `json:"scenario"`
+		Input       Input                 `json:"input"`
+		Passed      bool                  `json:"passed"`
+		Checks      []checkNorm           `json:"checks"`
+		LeaderTrace []leaderEventNorm     `json:"leader_trace"`
+		Faults      []faultNorm           `json:"faults"`
+		Writes      []writeNorm           `json:"writes"`
+		Compaction  *compactionNorm       `json:"compaction,omitempty"`
+		DupCatchup  *duplicateCatchupNorm `json:"duplicate_catchup,omitempty"`
+		Membership  *membershipNorm       `json:"membership,omitempty"`
+		Convergence convergenceNorm       `json:"convergence"`
 	}
 
 	checks := make([]checkNorm, 0, len(r.Checks))
@@ -118,6 +132,20 @@ func (r *Report) computeContentHash() string {
 			LeaderSnapshotAt:  r.Compaction.LeaderSnapshotAt,
 			CrossedCompaction: r.Compaction.CrossedCompaction,
 			InstalledSnapshot: r.Compaction.InstalledSnapshot,
+		}
+	}
+	var dcnorm *duplicateCatchupNorm
+	if r.DuplicateCatchup != nil {
+		d := r.DuplicateCatchup
+		dcnorm = &duplicateCatchupNorm{
+			InstalledSnapshot:       d.InstalledSnapshot,
+			AdvancedTo:              d.AdvancedTo,
+			ReplayedOldest:          d.ReplayedOldest,
+			ReplayedNewest:          d.ReplayedNewest,
+			AppliedAfterReplay:      d.AppliedAfterReplay,
+			ContentsChangedAfter:    d.ContentsChangedAfter,
+			FrontierRolledBackAfter: d.FrontierRolledBackAfter,
+			ReplayTookEffect:        d.ReplayTookEffect,
 		}
 	}
 	trace := make([]leaderEventNorm, 0, len(r.LeaderTrace))
@@ -154,6 +182,7 @@ func (r *Report) computeContentHash() string {
 		Faults:      faults,
 		Writes:      writes,
 		Compaction:  cnorm,
+		DupCatchup:  dcnorm,
 		Membership:  mnorm,
 		Convergence: convergenceNorm{
 			Reached:       r.Convergence.Reached,

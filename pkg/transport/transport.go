@@ -167,6 +167,16 @@ func (t *Transport) SendInstallSnapshot(ctx context.Context, from, to string, re
 	return resp, err
 }
 
+// Handler returns the currently registered handler for id without changing
+// any state. It is a read-only accessor used by test chaos (such as
+// deterministic message replay); it reports ok=false for an unknown id.
+func (t *Transport) Handler(id string) (Handler, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	h, ok := t.handlers[id]
+	return h, ok
+}
+
 // IsReachable reports whether messages from a to b are currently delivered.
 func (t *Transport) IsReachable(a, b string) bool {
 	_, ok := t.pick(a, b)

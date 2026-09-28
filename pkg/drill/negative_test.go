@@ -85,6 +85,19 @@ func TestNoFaultSnapshotDrillFails(t *testing.T) {
 	}
 }
 
+// TestNoFaultCatchupDuplicateDrillFails: when the victim is never taken
+// offline it never crosses a compaction boundary, so the duplicate-catch-up
+// drill must fail on its offline/crossed evidence rather than pass on steps.
+func TestNoFaultCatchupDuplicateDrillFails(t *testing.T) {
+	rep := runWithFaults(t, ScenarioCatchupDuplicateSnapshot, noopFaults{})
+	if rep.Passed {
+		t.Fatalf("drill PASSED although the catch-up node never went offline")
+	}
+	if !failedCheck(rep, "fault-node-offline") {
+		t.Fatalf("expected fault-node-offline to fail when crash is a no-op")
+	}
+}
+
 // TestNoFaultMembershipDrillFails: with no leader crash the claimed switch
 // cannot be evidenced and the drill must fail.
 func TestNoFaultMembershipDrillFails(t *testing.T) {
@@ -117,6 +130,47 @@ func (f *singleNodeFaults) Restart(ctx context.Context, id string) error {
 }
 func (f *singleNodeFaults) Partition(string, ...string) {}
 func (f *singleNodeFaults) HealAll()                    {}
+
+// crashButNoRestartFaults crashes for real but makes Restart a no-op: the node
+// genuinely goes offline and the cluster compacts, but it never returns and so
+// can never install a snapshot or be caught up. The duplicate-catch-up drill
+// must FAIL on recovery/install evidence, proving it does not pass merely
+// because the offline/compaction steps executed.
+type crashButNoRestartFaults struct{ c *cluster.Cluster }
+
+func (f *crashButNoRestartFaults) Crash(ctx context.Context, id string) error {
+	return f.c.Crash(ctx, id)
+}
+func (f *crashButNoRestartFaults) Restart(context.Context, string) error { return nil }
+func (f *crashButNoRestartFaults) Partition(string, ...string)           {}
+func (f *crashButNoRestartFaults) HealAll()                              {}
+
+// TestNoRecoveryCatchupDuplicateDrillFails: a victim that is crashed but never
+// restarted cannot install a snapshot, so the drill must fail on the recovery
+// and snapshot-install evidence.
+func TestNoRecoveryCatchupDuplicateDrillFails(t *testing.T) {
+	r, err := NewRunner(ScenarioCatchupDuplicateSnapshot, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.SetFaultFactory(func(c *cluster.Cluster) Faults {
+		return &crashButNoRestartFaults{c: c}
+	})
+	rep, err := r.Run(context.Background(), Options{
+		DataDir: t.TempDir(),
+		Input:   DefaultInput(ScenarioCatchupDuplicateSnapshot),
+		TickMS:  15,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Passed {
+		t.Fatalf("drill PASSED although the victim never restarted/caught up")
+	}
+	if !failedCheck(rep, "fault-node-recovered") {
+		t.Fatalf("expected fault-node-recovered to fail when Restart is a no-op")
+	}
+}
 
 // TestInsufficientFaultScopeFails uses a factory-bound fault set that only
 // ever takes one node down, proving insufficient fault scope cannot pass.

@@ -83,6 +83,27 @@ C_old  ──append+commit──▶  C_{old,new} (joint)  ──append+commit─
 - 长期离线节点的 `nextIndex` 落入快照区间时，领导者改发 `InstallSnapshot`；
   节点装入快照后再增量接收后续条目，无空洞、不回滚。
 
+### 追赶与重复投递（重传）语义
+
+节点只会**向前**移动，任何快照都不能把它拉回去：
+
+- 节点一旦在快照位置 `S`（`snapMeta.Index`）装入过快照，就永久拥有 `1..S`
+  这段已确认历史；因此对任何 `LastIncludedIndex <= max(snapMeta.Index, commit)`
+  的 `InstallSnapshot`，一律**确认成功但不重装**（标准 Raft 的“快照只能前进”
+  规则）。这覆盖三类迟到/重复消息：网络重传、旧领导者的重试、节点已经装过的
+  同一快照。
+- 为什么必须连“相同位置”的快照也拒绝：重装会 `Restore` 应用状态到快照内容、
+  并 `Compact` 掉快照之后的 WAL，而此时节点可能已经把后续条目**应用到更靠后的
+  位置**——结果就是上报的 applied 位置仍然是最新的，真实保存的内容却少了快照
+  之后已经确认成功的写入（位置与内容对不上）。修复后应用位置（applied）单调
+  不减，且始终与状态机真实内容一致。
+- 重复/乱序的 `AppendEntries` 同理：一致性检查只截断**冲突后缀**，已提交前缀
+  永不被覆盖；节点已追到更靠后位置时，较早的追赶内容无法把状态改回旧值。
+- 所有 Raft 状态只在单事件循环上修改，快照“观察→重放”的故障注入也只是多投递
+  一条线路消息、效果仍回到该事件循环串行处理，因此并发读写期间不会出现半更新或
+  状态回退（`go test -race` 通过）。
+
+
 ## 只读观测
 
 `cluster.Observe()` 与 `raft.Node.Status()` 返回无锁缓存的只读快照
@@ -122,6 +143,8 @@ go test -race ./...
 - `TestAddServerReplicatesThenServes` / `TestRemoveServerThenCommit` /
   `TestMembershipChangeSurvivesLeaderSwitch`
 - `TestSnapshotCompactionAndCatchup`
+- `TestDuplicateSnapshotAfterAdvanceNoRollback` /
+  `TestDuplicateSnapshotRepeatableSameInput`（追赶后收到重复/较早快照不回退）
 - `TestConcurrentWritersAndReaders` / `TestDuplicateClientRequestIdempotent`
 
 运行时日志以 `STATE` 打印每次角色/提交/配置状态转换及其判定依据，以 `INFO`
@@ -135,7 +158,7 @@ go test -race ./...
 
 ## 故障演练（可留存、可复核、可重复）
 
-除了“跑一遍看结果”的脚本化验证，`cmd/qlog` 还内置了四套**故障演练**，全部离线
+除了“跑一遍看结果”的脚本化验证，`cmd/qlog` 还内置了五套**故障演练**，全部离线
 运行（不依赖网络、外部服务或人工盯日志），每套结束产出一份**机器可读 JSON
 审计报告**，并且只有在“故障确实生效”且“安全性质成立”两条都有证据时才给 PASS。
 
@@ -143,7 +166,7 @@ go test -race ./...
 
 ```
 go run ./cmd/qlog -list-drills                 # 列出全部演练名
-go run ./cmd/qlog -drill all                   # 顺序跑完四套，报告打到 stdout
+go run ./cmd/qlog -drill all                   # 顺序跑完五套，报告打到 stdout
 go run ./cmd/qlog -drill majority-unreachable  # 只跑某一套
 go run ./cmd/qlog -drill all -report-out out/  # 每套一个 JSON 文件
 go run ./cmd/qlog -drill leader-crash-retry -report-out r.json
@@ -156,6 +179,7 @@ go run ./cmd/qlog -drill leader-crash-retry -report-out r.json
 | `majority-unreachable` | 多数派整体崩溃不可达时，幸存者无法确认新写入、提交位置不前进；多数派以更高任期恢复后，被拒写入绝不被追认，全集群收敛为同一份历史 |
 | `leader-crash-retry` | 写入结果未知的瞬间领导者硬崩溃；用同一 `(client,seq)` 经新领导者重试，状态机去重表证明该请求只生效一次（首次已提交则重试命中去重，首次丢失则重试恰好生效） |
 | `offline-compaction-catchup` | 节点离线足够久、错过至少一次压缩（领导者快照点严格越过其最后提交位置）后返回，经 InstallSnapshot 装入快照再增量追赶，窗口前后数据无空洞、全集群收敛 |
+| `offline-catchup-duplicate-delivery` | 节点错过压缩点后经快照追赶、再增量追到明显更靠后的位置，随后**确定性地重投**它已装过的快照（以及更早的追赶快照）模拟网络重传；节点必须忽略重复快照、applied 前沿与状态机内容都不回退、上报位置与真实内容一致，最终全集群收敛为同一份历史 |
 | `membership-leader-switch` | 加节点变更在途（观察到 learner 暂存或 joint 配置）时领导者硬崩溃；故障切换后变更收敛为唯一一致配置，绝不半更新，写入与收敛保持正确 |
 
 ### 审计报告字段（固定顺序）
@@ -167,10 +191,25 @@ go run ./cmd/qlog -drill leader-crash-retry -report-out r.json
 - `checks[]`：每条判定 `{id, passed, evidence}`。`id` 与 `passed` 是稳定事实；
   `evidence` 是给人看的细节（含当轮具体节点/任期，允许跨轮不同）。
 - `leader_trace[]`：各阶段观察到的领导者与任期（谁在何时主导、是否发生切换）。
-- `faults[]`：实际注入的故障（类型、阶段、涉及节点数、`took_effect`、证据）。
+- `faults[]`：实际注入的故障，逐条区分**故障类型与阶段、涉及哪些节点、是否真的
+  生效**。字段含义：
+  - `kind`：故障类别。`crash` = 硬崩溃（停事件循环并从传输层注销，磁盘保留）；
+    `duplicate-delivery` = 追赶快照的重复投递/网络重传；成员演练里还会出现
+    `partition`（双向网络隔离）。
+  - `phase`：该故障发生在演练的哪个阶段（如 `long-offline`、
+    `post-catchup-retransmission`）。
+  - `nodes`：**具体被隔离/崩溃/重启/重传命中的节点**（当轮真实身份，逐套演练
+    分别列出，不混在一起）。
+  - `took_effect`：故障是否确实生效的布尔证据（如崩溃后传输层实测不可达、
+    重传消息确实送达了目标处理器）。它是判定依据，不是“步骤跑过就算”。
 - `writes[]`：关键写入的命运——被接受还是被拒、去重命中次数、**生效次数**。
-- `compaction`：追赶演练专用——离线时提交位置、返回时领导者快照边界、是否真的
+- `compaction`：普通追赶演练专用——离线时提交位置、返回时领导者快照边界、是否真的
   跨过压缩点、实际装入的快照位置。
+- `duplicate_catchup`：重复投递追赶演练专用——离线时提交位置、实际装入以跨过压缩
+  点的快照位置、重投前已增量追到的位置（`advanced_to_before_replay`）、被重投的
+  最旧/最新快照位置、重投后的 applied 位置、内容是否变化（`contents_changed_
+  after_replay`）、前沿是否回退（`frontier_rolled_back_after_replay`）、重传是否
+  真正送达（`replay_took_effect`）。安全要求：后三个布尔分别为 `false/false/true`。
 - `membership`：成员变更演练专用——是否观察到 joint、新旧领导者、是否切换、最终选民。
 - `convergence`：最终各节点 commit/applied/快照位置、选民、状态摘要，以及
   `history_hash`（规范化的已提交 KV 内容摘要）与 `reached`。
@@ -180,23 +219,27 @@ go run ./cmd/qlog -drill leader-crash-retry -report-out r.json
 ### 可重复性边界（重要）
 
 复跑同一固定输入时**必须一致**的是：总判定、每条 check 的 `id/passed`、故障是否
-生效、写入接受/拒绝与生效次数、是否跨过压缩点、是否发生领导权切换、最终 commit/
-applied 位置、最终已提交历史（`history_hash`/`content_hash`）。
+生效、写入接受/拒绝与生效次数、是否跨过压缩点、追赶时是否被重投快照且未回退、是否
+发生领导权切换、最终 commit/applied 位置、最终已提交历史（`history_hash`/
+`content_hash`）。
 
 允许不同的是：时间戳与耗时；**具体哪台机器**被选为领导者或受害者（选举超时是
 随机的）；节点的具体 term 编号；追赶演练里离线节点停下时的**具体提交位置**
 （可能因首个领导者提交启动条目的心跳时序相差一）。这些身份/调度信息被刻意排除在
 `content_hash` 之外（领导权“是否切换”“是否真跨过压缩点”作为布尔事实保留），因此
 不同机器中选或离线位置差一都不会让历史结论漂移；该具体位置仍完整保留在 JSON 报告
-的 `compaction.offline_commit_at` 中供查看。
+的 `compaction.offline_commit_at` / `duplicate_catchup.offline_commit_at` 中供查看。
+注意：重复投递演练里重投的快照边界（32/96 等）由固定写入条数与压缩阈值（32）确定，
+是确定性事实，因此保留在 `content_hash` 中。
 
 用固定输入复跑并比对：
 
 ```
-go run ./cmd/qlog -drill all -report-out run1/
+go run ./cmd/qlog -drill all -report-out run1/   # run1/ 需已存在；每场景一个 JSON
 go run ./cmd/qlog -drill all -report-out run2/
 # 比较每个场景 JSON 的 content_hash 与每条 checks[].passed；
 # started_at_iso / duration_ms / evidence 文本 / 具体节点名与 term 可忽略
+# （报告目录须先 mkdir，-report-out 指向已存在目录时才按场景拆分文件）
 ```
 
 ### 证据原则：故障没真正生效就必须失败
@@ -207,30 +250,42 @@ go run ./cmd/qlog -drill all -report-out run2/
   选出**更高任期**的新领导者（否则被隔离领导者的未提交尾巴可能被错误追认）；
 - 声称“节点离线”，必须实测其在传输层不可达；
 - 声称“跨过压缩点”，必须实测领导者快照索引严格大于该节点离线时的最后提交位置；
+- 声称“快照重传”，必须实测重复的 `InstallSnapshot` 确实送达了目标处理器
+  （`replay_took_effect=true`），并且重投后内容不变、applied 前沿不回退；
 - 声称“领导权切换”，必须实测出现不同节点且任期严格增大。
 
-测试用一个**空操作故障注入器**（Crash/Restart/分区全部 no-op）和一个“只让单台
-宕机”的不足范围注入器验证：这些情况下演练一律 FAIL，绝不会因为脚本走完而 PASS。
+测试用一个**空操作故障注入器**（Crash/Restart/分区全部 no-op）、一个“只让单台
+宕机”的不足范围注入器，以及一个“真崩溃但 Restart 为 no-op（节点永不回来）”的注入器
+验证：这些情况下演练一律 FAIL，绝不会因为脚本走完而 PASS。
 
 ### 自动化测试
 
 ```
-go test ./pkg/drill/            # 四类演练成功判定、失败判定、可重复性
+go test ./pkg/drill/            # 五类演练成功判定、失败判定、可重复性
 go test ./...                   # 含既有正常写入/崩溃恢复/成员变更/压缩追赶不回归
 go test -race ./...             # 数据竞争
 ```
 
+关键用例（集群层确定性复现，不靠多跑碰运气）：
+
+- `TestDuplicateSnapshotAfterAdvanceNoRollback`：节点错过压缩点→装快照→增量追到更
+  靠后位置后，**确定性地重投**旧快照与已装快照，断言 applied/commit 不回退、状态机
+  内容摘要不变；该用例在回退修复前必然失败、修复后通过。
+- `TestDuplicateSnapshotRepeatableSameInput`：同一固定输入连跑三次，每轮“重投前后
+  必须一致”，且各轮最终 applied 位置与历史摘要完全相同。
+
 关键用例：
 
-- `TestAllDrillsPassWithFixedInput`：四套演练在固定输入下全部 PASS；
+- `TestAllDrillsPassWithFixedInput`：五套演练在固定输入下全部 PASS；
 - `TestRepeatableVerdict`：同一输入独立复跑两次，判定与 `content_hash` 一致；
-- `TestNoFault*DrillFails` / `TestInsufficientFaultScopeFails`：故障不生效或范围
-  不足时演练必须 FAIL（异常用例不能只检查流程走到）；
+- `TestNoFault*DrillFails` / `TestInsufficientFaultScopeFails` /
+  `TestNoRecoveryCatchupDuplicateDrillFails`：故障不生效、范围不足或节点永不回来时
+  演练必须 FAIL（异常用例不能只检查流程走到）；
 - `TestReportIsMachineReadable`：报告可序列化、字段齐全、哈希可重算。
 
 ### 当前**未**覆盖的故障类型
 
-演练聚焦四类最关键的协调故障，尚**未**模拟：真实网络磁盘 IO（走的是进程内传输与
+演练聚焦五类最关键的协调故障，尚**未**模拟：真实网络磁盘 IO（走的是进程内传输与
 本地文件，`SyncWrites=false` 时不真正 fsync）；拜占庭/恶意节点；持续随机丢包/延迟
 叠加（传输层支持 `DropRate/SetLatency`，但演练用确定性故障）；时钟漂移；脑裂后双写
 的人为客户端；快照文件物理损坏下的追赶；以及删除领导者（remove-leader）与故障

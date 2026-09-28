@@ -22,6 +22,13 @@ const (
 	// ScenarioMembershipLeaderSwitch: a membership change is in flight when
 	// leadership changes; the change ends consistent, never half-applied.
 	ScenarioMembershipLeaderSwitch Scenario = "membership-leader-switch"
+	// ScenarioCatchupDuplicateSnapshot: a node misses a compaction boundary
+	// while offline, catches up via InstallSnapshot, advances beyond it, and
+	// then deterministically receives a DUPLICATE/older catch-up snapshot
+	// (network retransmission). The duplicate must be a no-op: no state
+	// rollback, the reported applied position keeps matching real contents and
+	// the cluster converges to one history.
+	ScenarioCatchupDuplicateSnapshot Scenario = "offline-catchup-duplicate-delivery"
 )
 
 // Scenarios lists all built-in drills in their fixed run order.
@@ -30,6 +37,7 @@ func Scenarios() []Scenario {
 		ScenarioMajorityDown,
 		ScenarioLeaderCrashRetry,
 		ScenarioSnapshotCatchup,
+		ScenarioCatchupDuplicateSnapshot,
 		ScenarioMembershipLeaderSwitch,
 	}
 }
@@ -65,20 +73,24 @@ type NodeFinal struct {
 // other fact-bearing field feeds ContentHash so a repeat run with the same
 // input produces the same historical facts and verdict.
 type Report struct {
-	Schema       string            `json:"schema"`
-	Scenario     Scenario          `json:"scenario"`
-	Input        Input             `json:"input"`
-	Passed       bool              `json:"passed"`
-	Checks       []CheckResult     `json:"checks"`
-	LeaderTrace  []LeaderEvent     `json:"leader_trace"`
-	Faults       []FaultRecord     `json:"faults"`
-	Writes       []WriteRecord     `json:"writes"`
-	Compaction   *CompactionRecord `json:"compaction,omitempty"`
-	Membership   *MembershipRecord `json:"membership,omitempty"`
-	Convergence  ConvergenceRecord `json:"convergence"`
-	StartedAtISO string            `json:"started_at_iso"`
-	DurationMS   int64             `json:"duration_ms"`
-	ContentHash  string            `json:"content_hash"`
+	Schema      string            `json:"schema"`
+	Scenario    Scenario          `json:"scenario"`
+	Input       Input             `json:"input"`
+	Passed      bool              `json:"passed"`
+	Checks      []CheckResult     `json:"checks"`
+	LeaderTrace []LeaderEvent     `json:"leader_trace"`
+	Faults      []FaultRecord     `json:"faults"`
+	Writes      []WriteRecord     `json:"writes"`
+	Compaction  *CompactionRecord `json:"compaction,omitempty"`
+	// DuplicateCatchup is set by the offline-catchup-duplicate-delivery drill
+	// and records the deterministic stale/duplicate snapshot retransmission
+	// evidence.
+	DuplicateCatchup *DuplicateCatchupRecord `json:"duplicate_catchup,omitempty"`
+	Membership       *MembershipRecord       `json:"membership,omitempty"`
+	Convergence      ConvergenceRecord       `json:"convergence"`
+	StartedAtISO     string                  `json:"started_at_iso"`
+	DurationMS       int64                   `json:"duration_ms"`
+	ContentHash      string                  `json:"content_hash"`
 }
 
 // Input is the fixed, repeatable input of a drill. Two runs with an identical
@@ -145,6 +157,40 @@ type CompactionRecord struct {
 	LeaderSnapshotAt  uint64 `json:"leader_snapshot_index_at_return"`
 	CrossedCompaction bool   `json:"crossed_compaction"`
 	InstalledSnapshot uint64 `json:"installed_snapshot_index"`
+}
+
+// DuplicateCatchupRecord captures evidence for the deterministic duplicate
+// catch-up delivery drill. The safety fact is that re-delivering an older or
+// already-installed snapshot after the node advanced past it changes neither
+// its applied frontier nor its state-machine contents.
+type DuplicateCatchupRecord struct {
+	// Node is the role-slot of the victim ("first-follower"); the concrete id
+	// is run-dependent and excluded from the content hash.
+	Node string `json:"node"`
+	// OfflineCommitAt is the commit position the victim had when taken offline.
+	OfflineCommitAt uint64 `json:"offline_commit_at"`
+	// InstalledSnapshot is the boundary snapshot the victim installed to cross
+	// the compaction point.
+	InstalledSnapshot uint64 `json:"crossed_compaction"`
+	// AdvancedTo is the applied position the victim reached via incremental
+	// AppendEntries BEFORE the duplicate snapshot was re-delivered; the
+	// duplicate must not move it.
+	AdvancedTo uint64 `json:"advanced_to_before_replay"`
+	// ReplayedOldest / ReplayedNewest are the snapshot indexes re-delivered
+	// (the stale boundary snapshot and the just-installed one). Both are <= the
+	// victim's installed/applied frontier.
+	ReplayedOldest uint64 `json:"replayed_oldest_snapshot"`
+	ReplayedNewest uint64 `json:"replayed_newest_snapshot"`
+	// AppliedAfterReplay / ContentsChangedAfterReplay are the post-replay
+	// observations. Safety requires the frontier to be unchanged and the
+	// contents hash to be identical.
+	AppliedAfterReplay      uint64 `json:"applied_after_replay"`
+	ContentsChangedAfter    bool   `json:"contents_changed_after_replay"`
+	FrontierRolledBackAfter bool   `json:"frontier_rolled_back_after_replay"`
+	// ReplayTookEffect is true when the duplicate messages were really
+	// delivered to the victim's handler (delivery actually happened, even
+	// though a correct node ignores them).
+	ReplayTookEffect bool `json:"replay_took_effect"`
 }
 
 // MembershipRecord captures a membership change interleaved with a leader
