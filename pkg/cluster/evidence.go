@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/h3yow/quorum-log-replication-go/pkg/raft"
+	"github.com/h3yow/quorum-log-replication-go/pkg/raftproto"
 	"github.com/h3yow/quorum-log-replication-go/pkg/statemachine"
 )
 
@@ -123,6 +124,61 @@ type LogEntry struct {
 	Term   uint64
 	Data   []byte
 	Config bool
+}
+
+// SnapshotBundle is one node's persisted snapshot as observed for evidence:
+// its meta (index/term/config) plus the raw application payload.
+type SnapshotBundle struct {
+	Index uint64
+	Term  uint64
+	Data  []byte
+}
+
+// SnapshotOf returns id's currently persisted snapshot, or ok=false when the
+// node has none. It is a read-only evidence path used to deterministically
+// replay a duplicated/retransmitted InstallSnapshot at a fixed position
+// (instead of relying on random retransmission timing).
+func (c *Cluster) SnapshotOf(id string) (SnapshotBundle, bool, error) {
+	c.mu.RLock()
+	h, ok := c.nodes[id]
+	c.mu.RUnlock()
+	if !ok {
+		return SnapshotBundle{}, false, errors.New("cluster: unknown node " + id)
+	}
+	meta, data, err := h.snap.Load()
+	if err != nil {
+		return SnapshotBundle{}, false, err
+	}
+	if meta == nil {
+		return SnapshotBundle{}, false, nil
+	}
+	return SnapshotBundle{Index: meta.Index, Term: meta.Term, Data: data}, true, nil
+}
+
+// DeliverInstallSnapshot injects one InstallSnapshot RPC fromLeader -> id
+// synchronously through the simulated transport. It is a deterministic test
+// trigger for "a duplicate/retransmitted catch-up payload arrives after the
+// follower already moved past it": the caller supplies the exact snapshot
+// position to replay. It returns the Raft response.
+func (c *Cluster) DeliverInstallSnapshot(ctx context.Context, fromLeader, id string, snap SnapshotBundle) (bool, error) {
+	leader := c.Node(fromLeader)
+	if leader == nil {
+		return false, errors.New("cluster: unknown leader " + fromLeader)
+	}
+	req := &raftproto.InstallSnapshotRequest{
+		Term:              leader.Status().Term,
+		LeaderID:          fromLeader,
+		LastIncludedIndex: snap.Index,
+		LastIncludedTerm:  snap.Term,
+		Data:              snap.Data,
+		Config:            leader.Status().CommittedConfig,
+		Done:              true,
+	}
+	resp, err := c.tr.SendInstallSnapshot(ctx, fromLeader, id, req)
+	if err != nil {
+		return false, err
+	}
+	return resp.Success, nil
 }
 
 // RetainedEntries returns the entries still held in id's WAL window

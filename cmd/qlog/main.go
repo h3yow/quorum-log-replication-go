@@ -61,6 +61,29 @@ func main() {
 	runDrills(ctx, dir, *d, *reportOut, *tickMS)
 }
 
+func waitSmokeAligned(c *cluster.Cluster, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		obs := c.Observe()
+		var want uint64
+		for _, s := range obs.Nodes {
+			if s.CommitIndex > want {
+				want = s.CommitIndex
+			}
+		}
+		aligned := len(obs.Nodes) > 0
+		for _, s := range obs.Nodes {
+			if s.LastApplied != want {
+				aligned = false
+			}
+		}
+		if aligned {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func runSmoke(ctx context.Context, dir string, n int) {
 	ids := make([]string, 0, n)
 	for i := 1; i <= n; i++ {
@@ -82,6 +105,10 @@ func runSmoke(ctx context.Context, dir string, n int) {
 		fmt.Printf("[%2d/%2d] OK   %-28s (%s)\n", i+1, len(scenario), s.name, time.Since(t0).Round(time.Millisecond))
 	}
 
+	// Wait for every node to apply up to a single common position before
+	// printing the summary, so the reported applied positions and the actual
+	// saved contents are shown in their quiescent, converged state.
+	waitSmokeAligned(c, 5*time.Second)
 	obs := c.Observe()
 	fmt.Println("------------------------------------------------------------")
 	fmt.Printf("leader: %s\n", obs.Leader)

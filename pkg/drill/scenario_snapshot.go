@@ -92,8 +92,20 @@ func runSnapshotCatchup(fr *frame) *Report {
 		rc.check("fault-node-recovered", false, err.Error())
 		return rc.rep
 	}
+	// Fault evidence: the victim is genuinely reachable again after restart.
+	time.Sleep(200 * time.Millisecond)
+	backReachable := !fr.c.IsDown(victim)
+	rc.fault("restart", "long-offline-return", []string{victim}, backReachable,
+		fmt.Sprintf("node=%s reachable=%t after restart", victim, backReachable))
 	back := fr.waitLeader(5 * time.Second)
-	rc.check("fault-node-recovered", back != "", fmt.Sprintf("leader=%s", back))
+	rc.check("fault-node-recovered", backReachable && back != "",
+		fmt.Sprintf("leader=%s victim_reachable=%t", back, backReachable))
+	// A victim that never actually came back cannot install a snapshot or
+	// converge; fail immediately on the missing precondition rather than
+	// running out the full convergence timeout.
+	if !backReachable || back == "" {
+		return rc.rep
+	}
 
 	// Continue writing to prove incremental replication resumes after the
 	// snapshot install.
@@ -126,6 +138,55 @@ func runSnapshotCatchup(fr *frame) *Report {
 	}
 	rc.check("lagging-node-installed-snapshot", gotSnapshot,
 		fmt.Sprintf("victim=%s installed_snapshot=%d leader_snapshot=%d", victim, installed, leaderSnap))
+
+	// Deterministic duplicate/retransmission check: wait for the victim to
+	// fully converge (so no entries are still in flight), capture the snapshot
+	// the leader used for the initial catch-up and REPLAY it on demand after
+	// the victim has moved past it incrementally. A late duplicate must be
+	// acked without rolling any state back (applied position and KV contents
+	// unchanged). This replaces the flaky "rerun and hope for a retransmit"
+	// trigger with one fixed, synchronous injection on a quiesced cluster.
+	replayOK := false
+	replayDetail := "victim did not cross snapshot boundary; replay skipped"
+	if gotSnapshot {
+		conv0 := fr.snapshotConvergence(30 * time.Second)
+		if !conv0.Reached {
+			replayDetail = "cluster did not converge before duplicate replay"
+		} else {
+			ld := fr.waitLeader(2 * time.Second)
+			bundle, hasSnap, serr := fr.c.SnapshotOf(ld)
+			if serr != nil || !hasSnap || bundle.Index == 0 {
+				replayDetail = fmt.Sprintf("capture leader snapshot: has=%t err=%v", hasSnap, serr)
+			} else if conv0.CommonApplied <= bundle.Index {
+				replayDetail = fmt.Sprintf("common applied=%d not past snapshot=%d",
+					conv0.CommonApplied, bundle.Index)
+			} else {
+				preStatus := fr.c.Node(victim).Status()
+				preKV, _ := fr.c.KVHash(victim)
+				const replays = 3
+				acked := 0
+				for j := 0; j < replays; j++ {
+					if ok, derr := fr.c.DeliverInstallSnapshot(ctx, ld, victim, bundle); derr == nil && ok {
+						acked++
+					}
+				}
+				postStatus := fr.c.Node(victim).Status()
+				postKV, _ := fr.c.KVHash(victim)
+				noRollback := postStatus.CommitIndex == preStatus.CommitIndex &&
+					postStatus.LastApplied == preStatus.LastApplied &&
+					postStatus.LastApplied == postStatus.CommitIndex &&
+					postKV == preKV
+				replayOK = acked == replays && noRollback
+				replayDetail = fmt.Sprintf(
+					"replayed snapshot@%d x%d acked=%d; applied=%d->%d commit=%d->%d kv_unchanged=%t",
+					bundle.Index, replays, acked,
+					preStatus.LastApplied, postStatus.LastApplied,
+					preStatus.CommitIndex, postStatus.CommitIndex, postKV == preKV)
+			}
+		}
+	}
+	rc.fault("retransmit", "duplicate-catchup-after-progress", []string{victim}, replayOK, replayDetail)
+	rc.check("duplicate-catchup-no-rollback", replayOK, replayDetail)
 
 	conv := fr.snapshotConvergence(45 * time.Second)
 	rc.rep.Convergence = conv

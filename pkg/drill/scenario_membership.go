@@ -115,11 +115,16 @@ func runMembershipLeaderSwitch(fr *frame) *Report {
 		rc.check("crashed-leader-restarted", false, err.Error())
 		return rc.rep
 	}
+	time.Sleep(200 * time.Millisecond)
+	backReachable := !fr.c.IsDown(leader)
+	rc.fault("restart", "crashed-leader-return", []string{leader}, backReachable,
+		fmt.Sprintf("node=%s reachable=%t after restart", leader, backReachable))
 	if fr.waitLeader(5*time.Second) == "" {
 		rc.check("crashed-leader-restarted", false, "no leader after restart")
 		return rc.rep
 	}
-	rc.check("crashed-leader-restarted", true, "cluster serves after old leader returns")
+	rc.check("crashed-leader-restarted", backReachable,
+		fmt.Sprintf("cluster serves after old leader returns; reachable=%t", backReachable))
 
 	// Retry to converge; AddNode is a safe idempotent no-op for a present voter.
 	retryErr := fr.c.AddNode(ctx, newNode)

@@ -143,3 +143,44 @@ func TestInsufficientFaultScopeFails(t *testing.T) {
 		t.Fatalf("expected fault-majority-injected to fail when only one node is down")
 	}
 }
+
+// crashNoRestartFaults performs the real crashes and partitions but turns
+// Restart into a no-op. A drill that claims nodes "recovered" must fail on the
+// restart-effect evidence, rather than passing merely because its steps ran.
+type crashNoRestartFaults struct{ c *cluster.Cluster }
+
+func (f *crashNoRestartFaults) Crash(ctx context.Context, id string) error {
+	return f.c.Crash(ctx, id)
+}
+func (f *crashNoRestartFaults) Restart(context.Context, string) error { return nil }
+func (f *crashNoRestartFaults) Partition(id string, peers ...string) {
+	f.c.Partition(id, peers...)
+}
+func (f *crashNoRestartFaults) HealAll() { f.c.HealAll() }
+
+// TestCrashWithoutRestartDrillFails: when the offline node is never actually
+// brought back, the snapshot-catchup drill must fail its restart and
+// convergence/rollback evidence — it can never report a recovered cluster.
+func TestCrashWithoutRestartDrillFails(t *testing.T) {
+	r, err := NewRunner(ScenarioSnapshotCatchup, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.SetFaultFactory(func(c *cluster.Cluster) Faults {
+		return &crashNoRestartFaults{c: c}
+	})
+	rep, err := r.Run(context.Background(), Options{
+		DataDir: t.TempDir(),
+		Input:   DefaultInput(ScenarioSnapshotCatchup),
+		TickMS:  15,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Passed {
+		t.Fatalf("drill PASSED although the offline node was never restarted")
+	}
+	if !failedCheck(rep, "fault-node-recovered") {
+		t.Fatalf("expected fault-node-recovered to fail when restart is a no-op")
+	}
+}

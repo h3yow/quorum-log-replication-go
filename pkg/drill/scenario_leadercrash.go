@@ -118,8 +118,13 @@ func runLeaderCrashRetry(fr *frame) *Report {
 		rc.check("crashed-leader-restarted", false, err.Error())
 		return rc.rep
 	}
+	time.Sleep(200 * time.Millisecond)
+	backReachable := !fr.c.IsDown(old)
+	rc.fault("restart", "crashed-leader-return", []string{old}, backReachable,
+		fmt.Sprintf("node=%s reachable=%t after restart", old, backReachable))
 	l := fr.waitLeader(5 * time.Second)
-	rc.check("crashed-leader-restarted", l != "", fmt.Sprintf("leader=%s", l))
+	rc.check("crashed-leader-restarted", backReachable && l != "",
+		fmt.Sprintf("leader=%s old_leader_reachable=%t", l, backReachable))
 	if l != "" {
 		rc.recordLeader("after-restart", l, fr.c.Node(l).Status().Term)
 	}

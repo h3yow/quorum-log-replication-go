@@ -112,14 +112,41 @@ func runMajorityDown(fr *frame) *Report {
 	for _, id := range survivors {
 		fr.faults.Partition(id, victims...)
 	}
+	// Fault evidence: the partition is real and bidirectional — no survivor can
+	// reach any victim and vice versa.
+	time.Sleep(200 * time.Millisecond)
+	isolated := true
+	var badPair string
+	for _, sID := range survivors {
+		for _, vID := range victims {
+			if fr.c.Transport().IsReachable(sID, vID) || fr.c.Transport().IsReachable(vID, sID) {
+				isolated = false
+				badPair = sID + "<->" + vID
+			}
+		}
+	}
+	rc.fault("partition", "minority-isolated-during-majority-restart",
+		append(append([]string(nil), survivors...), victims...), isolated,
+		fmt.Sprintf("survivors=%v victims=%v still_reachable_pair=%q", survivors, victims, badPair))
+	rc.check("fault-partition-injected", isolated,
+		fmt.Sprintf("bidirectional split survivors=%v | victims=%v bad_pair=%q", survivors, victims, badPair))
 	for _, id := range victims {
 		if err := fr.faults.Restart(ctx, id); err != nil {
 			rc.check("fault-majority-recovered", false, "restart "+id+": "+err.Error())
 			return rc.rep
 		}
 	}
+	time.Sleep(200 * time.Millisecond)
+	restarted := true
+	for _, id := range victims {
+		if fr.c.IsDown(id) {
+			restarted = false
+		}
+	}
+	rc.fault("restart", "majority-restart", victims, restarted,
+		fmt.Sprintf("nodes=%v reachable=%t", victims, restarted))
 	newLeader := waitLeaderAmong(fr, victims, 5*time.Second)
-	recovered := newLeader != ""
+	recovered := restarted && newLeader != ""
 	rc.check("fault-majority-recovered", recovered,
 		fmt.Sprintf("majority-side leader=%s after restoring %v", newLeader, victims))
 

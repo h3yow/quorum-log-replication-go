@@ -112,6 +112,25 @@ func (n *Node) handleInstallSnapshot(from string, req *raftproto.InstallSnapshot
 	n.electionElapsed = 0
 	n.resetElectionTimeout()
 
+	// Never let an older catch-up payload overwrite a position the follower
+	// has already moved past. This guard must be against the COMMITTED frontier
+	// (not merely snapMeta.Index): after installing a snapshot the follower
+	// usually advances commit/applied by incremental AppendEntries well before
+	// it compacts its own log, and during that window a duplicated or
+	// retransmitted InstallSnapshot from a retry/leader change would otherwise
+	// re-enter installSnapshot and Restore() the state machine back to an
+	// older prefix while commit/applied kept reporting the newer position.
+	if req.LastIncludedIndex <= n.commit {
+		// The content up to this index is already part of this node's committed
+		// prefix, so the request is stale-but-valid, not an error: ack it without
+		// touching any state. Acking (rather than rejecting) lets the leader
+		// advance this peer's nextIndex and continue streaming newer entries;
+		// rejecting would strand it resending the same snapshot forever.
+		n.logger.infof("ignore duplicate/stale snapshot %d (commit=%d applied=%d); acking without rollback",
+			req.LastIncludedIndex, n.commit, n.applied)
+		resp.Success = true
+		return resp
+	}
 	if req.LastIncludedIndex < n.snapMeta.Index {
 		n.logger.infof("reject stale snapshot %d (have %d)",
 			req.LastIncludedIndex, n.snapMeta.Index)
@@ -135,7 +154,17 @@ func (n *Node) handleInstallSnapshot(from string, req *raftproto.InstallSnapshot
 // installSnapshot replaces local state with the snapshot contents. The
 // durable operation is: save snapshot file, discard superseded WAL entries,
 // restore application. Any failure leaves a distinguishable store error.
+//
+// It is idempotent and never rolls state backwards: a snapshot at or below the
+// applied frontier is a no-op (the content is already present), so a
+// duplicated or retransmitted request cannot Restore() the application to an
+// older prefix while the applied watermark keeps reporting a newer position.
 func (n *Node) installSnapshot(data []byte, index, term uint64, cfg raftproto.Config) error {
+	if index <= n.applied {
+		n.logger.infof("installSnapshot: skip snapshot at %d already applied at %d",
+			index, n.applied)
+		return nil
+	}
 	meta := raftproto.SnapshotMeta{Index: index, Term: term, Config: cfg}
 	if err := n.snaps.Save(meta, data); err != nil && err != logstore.ErrSnapOutOfDate {
 		return err

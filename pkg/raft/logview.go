@@ -1,6 +1,8 @@
 package raft
 
 import (
+	"fmt"
+
 	"github.com/h3yow/quorum-log-replication-go/pkg/logstore"
 	"github.com/h3yow/quorum-log-replication-go/pkg/raftproto"
 )
@@ -107,6 +109,15 @@ func (n *Node) appendEntries(ents []raftproto.Entry) (uint64, error) {
 			}
 		}
 		if cut > 0 {
+			// A conflicting entry at or below the commit index can only come
+			// from a stale/retransmitted request: Raft guarantees committed
+			// entries are never overwritten with a different term. Refuse to
+			// truncate them so a late duplicate can never roll the committed
+			// (and possibly already applied) prefix backwards.
+			if cut <= n.commit {
+				return 0, fmt.Errorf("%w: refusing to truncate committed index %d (commit=%d) from a conflicting append",
+					logstore.ErrCompacted, cut, n.commit)
+			}
 			// truncate from cut, replace with the new suffix
 			var fresh []raftproto.Entry
 			for i := range ents {
